@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""Editor RGB para Bash; solo necesita la biblioteca estándar de Python."""
+import argparse
+import copy
+import codecs
+import colorsys
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+import unicodedata
+
+BEGIN = '# >>> colorssh >>>'
+END = '# <<< colorssh <<<'
+LABELS = ['Fondo de terminal', 'Texto de terminal', 'Texto del prompt', 'Fondo del prompt']
+DEFAULT = [[0, 0, 0], [229, 229, 229], [0, 0, 0], [205, 205, 0]]
+FILE_TYPES = [
+    ('fi', 'Archivo normal', [229, 229, 229], 'archivo.txt'),
+    ('di', 'Directorio', [92, 92, 255], 'carpeta/'),
+    ('ex', 'Ejecutable', [0, 205, 0], 'script.sh*'),
+    ('ln', 'Enlace simbólico', [0, 205, 205], 'enlace@'),
+    ('or', 'Enlace roto', [255, 0, 0], 'roto@'),
+    ('pi', 'Tubería FIFO', [205, 205, 0], 'tuberia|'),
+    ('so', 'Socket', [205, 0, 205], 'socket='),
+    ('bd', 'Dispositivo de bloque', [205, 205, 0], 'disco'),
+    ('cd', 'Dispositivo carácter', [205, 205, 0], 'terminal'),
+    ('su', 'Ejecutable setuid', [255, 92, 92], 'setuid*'),
+    ('sg', 'Ejecutable setgid', [255, 205, 0], 'setgid*'),
+    ('tw', 'Dir. sticky escribible', [0, 255, 0], 'tmp/'),
+    ('ow', 'Dir. escribible', [0, 205, 0], 'compartido/'),
+    ('st', 'Directorio sticky', [0, 205, 205], 'sticky/'),
+    ('mh', 'Enlaces duros múltiples', [229, 229, 229], 'enlace-duro'),
+    ('ca', 'Archivo capabilities', [255, 92, 92], 'capabilities*'),
+]
+LABELS += [item[1] for item in FILE_TYPES]
+DEFAULT += [item[2] for item in FILE_TYPES]
+ESC = '\x1b['
+
+
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def text_width(text):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+               for c in ANSI.sub('', text))
+
+
+def fit_text(text, width):
+    result = []
+    used = 0
+    for part in re.split(r'(\x1b\[[0-9;]*m)', text):
+        if ANSI.fullmatch(part):
+            result.append(part)
+            continue
+        for char in part:
+            size = text_width(char)
+            if used + size > width:
+                return ''.join(result)
+            result.append(char)
+            used += size
+    return ''.join(result)
+
+
+def config_dir():
+    return Path.home()/'.config'/'colorssh'
+
+
+def secure_directory(path):
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def display_text(value):
+    """Return text that cannot introduce terminal control sequences."""
+    return ''.join(char if char.isprintable() else '\ufffd' for char in str(value))
+
+
+def migrate_backups(path):
+    """Recoge las copias antiguas sin sobrescribir otras con el mismo nombre."""
+    destination = config_dir()
+    secure_directory(destination)
+    for source in path.parent.glob(path.name + '.bak.colorssh.*'):
+        if not source.is_file() or source.parent == destination:
+            continue
+        target = destination/source.name
+        while target.exists():
+            target = destination/(source.name + '.' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        with target.open('xb') as stream:
+            os.chmod(target, 0o600)
+            stream.write(source.read_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        shutil.copystat(source, target)
+        os.chmod(target, 0o600)
+        source.unlink()
+
+
+def valid_colors(value):
+    return (isinstance(value, list) and len(value) in (4, len(DEFAULT)) and all(
+        isinstance(c, list) and len(c) == 3 and all(type(v) is int and 0 <= v <= 255 for v in c)
+        for c in value))
+
+
+def hexcolor(rgb):
+    return '#' + ''.join(f'{v:02x}' for v in rgb)
+
+
+def sgr(rgb, background=False):
+    return f'{ESC}{48 if background else 38};2;' + ';'.join(map(str, rgb)) + 'm'
+
+
+def ansi_color(n):
+    base = [(0,0,0),(205,0,0),(0,205,0),(205,205,0),(0,0,238),(205,0,205),(0,205,205),(229,229,229),
+            (127,127,127),(255,0,0),(0,255,0),(255,255,0),(92,92,255),(255,0,255),(0,255,255),(255,255,255)]
+    if n < 16:
+        return list(base[n])
+    if n < 232:
+        n -= 16
+        levels = [0,95,135,175,215,255]
+        return [levels[n // 36], levels[n // 6 % 6], levels[n % 6]]
+    return [8 + (n - 232) * 10] * 3
+
+
+def load_colors(text):
+    match = re.search(r'^# colorssh-colors: (.+)$', text, re.M)
+    if match:
+        value = json.loads(match[1])
+        if not valid_colors(value):
+            raise ValueError('Configuración colorssh inválida')
+        return value + copy.deepcopy(DEFAULT[len(value):])
+    colors = copy.deepcopy(DEFAULT)
+    bg = re.search(r'11;#([0-9a-fA-F]{6})', text)
+    if bg:
+        colors[0] = [int(bg[1][i:i+2], 16) for i in (0,2,4)]
+    prompt = re.search(r"^\s*PS1='([^'\n]*(?:\\033|\\e)\[[^'\n]*)'", text, re.M)
+    if prompt:
+        # La primera secuencia define los colores; el reset final no los cambia.
+        match = re.search(r'\\(?:033|e)\[([\d;]+)m', prompt[1])
+        if match:
+            codes = list(map(int, match[1].split(';')))
+            i = 0
+            while i < len(codes):
+                code = codes[i]
+                if code in (38,48) and i + 2 < len(codes):
+                    target = 2 if code == 38 else 3
+                    if codes[i+1] == 5 and 0 <= codes[i+2] <= 255:
+                        colors[target] = ansi_color(codes[i+2]); i += 3; continue
+                    if codes[i+1] == 2 and i+4 < len(codes):
+                        colors[target] = codes[i+2:i+5]; i += 5; continue
+                if 30 <= code <= 37:
+                    colors[2] = ansi_color(code - 30)
+                if 40 <= code <= 47:
+                    colors[3] = ansi_color(code - 40)
+                i += 1
+    return colors
+
+
+def config_block(colors):
+    colors = colors + copy.deepcopy(DEFAULT[len(colors):])
+    file_colors = ':'.join(code + '=0;38;2;' + ';'.join(map(str, color))
+                           for (code, *_), color in zip(FILE_TYPES, colors[4:]))
+    fg, bg = (';'.join(map(str, colors[i])) for i in (2,3))
+    return f'''{BEGIN}
+# colorssh-colors: {json.dumps(colors)}
+__colorssh_apply() {{
+    case "$TERM" in
+        xterm*|rxvt*|screen*|tmux*) printf '\\033]10;{hexcolor(colors[1])}\\007\\033]11;{hexcolor(colors[0])}\\007' ;;
+    esac
+}}
+# Conserva los hooks originales, incluido el retorno de sesiones SSH.
+if declare -F __set_terminal_background_black >/dev/null; then
+    __set_terminal_background_black() {{ __colorssh_apply; }}
+else
+    if declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare -a'; then
+        if [[ ";${{PROMPT_COMMAND[*]}};" != *"__colorssh_apply"* ]]; then
+            PROMPT_COMMAND+=(__colorssh_apply)
+        fi
+    elif [[ "${{PROMPT_COMMAND:-}}" != *"__colorssh_apply"* ]]; then
+        PROMPT_COMMAND="__colorssh_apply${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}"
+    fi
+fi
+__colorssh_apply
+# Las reglas por extensión existentes conservan su prioridad.
+export LS_COLORS="${{LS_COLORS:+$LS_COLORS:}}{file_colors}"
+alias ll='ls -alF --color=auto'
+PS1='${{debian_chroot:+($debian_chroot)}}\\[\\033[1;38;2;{fg};48;2;{bg}m\\]\\u@\\h:\\w\\$\\[\\033[0m\\] '
+{END}
+'''
+
+
+def save_colors(path, original, colors):
+    """Valida, crea copia exclusiva y sustituye atómicamente sin pisar cambios externos."""
+    if not valid_colors(colors):
+        raise ValueError('Colores inválidos')
+    path = path.expanduser().resolve(strict=True)
+    if path.read_bytes() != original:
+        raise ValueError('.bashrc ha cambiado externamente. Sal y vuelve a abrir la aplicación.')
+    text = original.decode('utf-8')
+    if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1:
+        raise ValueError('Bloque colorssh incompleto o duplicado; no se ha modificado el archivo.')
+    block = config_block(colors)
+    if BEGIN in text:
+        pattern = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
+        if not pattern.search(text):
+            raise ValueError('Marcadores colorssh desordenados')
+        updated = pattern.sub(lambda _: block, text)
+    else:
+        updated = text + ('\n' if not text.endswith('\n') else '') + '\n' + block
+    data = updated.encode('utf-8')
+    result = subprocess.run(['bash', '-n'], input=data, capture_output=True)
+    if result.returncode:
+        raise ValueError('Bash rechaza la configuración: ' + result.stderr.decode().strip())
+    secure_directory(config_dir())
+    backup = config_dir()/(path.name + '.bak.colorssh.' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+    with backup.open('xb') as stream:
+        os.chmod(backup, 0o600)
+        stream.write(original)
+        stream.flush()
+        os.fsync(stream.fileno())
+    shutil.copystat(path, backup)
+    os.chmod(backup, 0o600)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.colorssh-', delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        shutil.copystat(path, tmp)
+        if path.read_bytes() != original:
+            raise ValueError('.bashrc ha cambiado durante el guardado; no se ha sobrescrito.')
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None and tmp.exists():
+            tmp.unlink()
+    return data, backup
+
+
+def builtin_presets():
+    """Paletas RGB de ejemplo; cada llamada devuelve copias nuevas."""
+    # Fondo, texto, azul, verde, cian, rojo, amarillo, violeta.
+    palettes = {
+        'Oscuro clásico': '000000 e5e5e5 5c5cff 00cd00 00cdcd ff5555 cdcd00 cd00cd',
+        'Dracula': '282a36 f8f8f2 bd93f9 50fa7b 8be9fd ff5555 f1fa8c ff79c6',
+        'Nord': '2e3440 eceff4 81a1c1 a3be8c 88c0d0 bf616a ebcb8b b48ead',
+        'Monokai': '272822 f8f8f2 66d9ef a6e22e 66d9ef f92672 e6db74 ae81ff',
+        'Gruvbox oscuro': '282828 ebdbb2 83a598 b8bb26 8ec07c fb4934 fabd2f d3869b',
+        'Solarizado oscuro': '002b36 93a1a1 268bd2 859900 2aa198 dc322f b58900 d33682',
+        'Tokyo Night': '1a1b26 c0caf5 7aa2f7 9ece6a 7dcfff f7768e e0af68 bb9af7',
+        'One Dark': '282c34 abb2bf 61afef 98c379 56b6c2 e06c75 e5c07b c678dd',
+        'Claro clásico': 'ffffff 242424 003faa 176b27 007078 b42318 805500 8236a0',
+        'Solarizado claro': 'fdf6e3 586e75 0069a6 526b00 087f78 c52b29 826000 a52b70',
+        'Océano profundo': '071e2b d5edf4 76b9ff 71d6a2 63dce5 ff8795 f2d685 c7a6ff',
+        'Bosque nocturno': '14231b dce8d5 8dbddd a9d478 74cbb5 f18c7e e2c87c c2a0db',
+        'Ámbar retro': '211608 f5d99b e9bc72 cbcf82 ffe0a3 ff9970 ffc34d d8a1bd',
+        'Violeta espacial': '20162f ece0fa aba4ff a7de9a 80d8e8 ff8fb8 efd28e d49bff',
+        'Café tostado': '2a201c ebd9c5 9fbcd2 b6ca91 97c9bd e59c86 e5c087 c9a7c9',
+        'Neón urbano': '101019 e9e9ff 839bff 80f5a4 63edee ff70a6 f9e779 d39aff',
+        'Papel crema': 'fff8e7 493d2c 285a91 3c692f 176b70 a23e32 805b12 79518b',
+        'Lavanda clara': 'f5efff 40354e 4e5aa5 3f7044 226d78 a53e65 826018 7946a0',
+        'Menta suave': 'ecf8f0 29463a 315e9b 2d703f 176b6c a13f42 7b6018 80508e',
+        'Hielo polar': 'edf5fc 2c4054 255fa0 367044 176c7c a33e50 80601c 73549b',
+        'Claude': 'faf9f5 141413 6a9bcc 788c5d 366c69 a64e35 80651f 76556f',
+    }
+    presets = {}
+    for name, palette in palettes.items():
+        bg, fg, blue, green, cyan, red, yellow, purple = [
+            [int(value[i:i+2], 16) for i in (0, 2, 4)] for value in palette.split()]
+        files = [fg, blue, green, cyan, red, yellow, purple, yellow,
+                 yellow, red, yellow, green, green, cyan, fg, red]
+        presets[name] = copy.deepcopy([bg, fg, bg, cyan] + files)
+    # Fondo y acentos de Anthropic; prompt oscuro sobre su terracota distintivo.
+    presets['Claude'][2:4] = [[20, 20, 19], [217, 119, 87]]
+    return presets
+
+
+def load_presets(path):
+    presets = builtin_presets()
+    if not path.exists():
+        write_presets(path, presets)
+        return presets
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict) or any(
+            not isinstance(name, str) or not name.strip() or len(name) > 60 or
+            not name.isprintable() or not valid_colors(colors)
+            for name, colors in value.items()):
+        raise ValueError('Archivo de combinaciones inválido')
+    presets.update({name: colors + copy.deepcopy(DEFAULT[len(colors):])
+                    for name, colors in value.items()})
+    if presets != value:
+        write_presets(path, presets)
+    return presets
+
+
+def save_preset(path, name, colors):
+    name = name.strip()
+    if not name or len(name) > 60 or not name.isprintable():
+        raise ValueError('Usa un nombre de 1 a 60 caracteres visibles')
+    if not valid_colors(colors):
+        raise ValueError('Colores inválidos')
+    presets = load_presets(path)
+    presets[name] = copy.deepcopy(colors)
+    write_presets(path, presets)
+
+
+def write_presets(path, presets):
+    if path.parent == config_dir():
+        secure_directory(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.colorssh-presets-', delete=False) as stream:
+            tmp = Path(stream.name)
+            json.dump(presets, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp is not None and tmp.exists():
+            tmp.unlink()
+
+
+
+class App:
+    def __init__(self, path, presets_path=None):
+        self.presets_path = presets_path or config_dir()/'presets.json'
+        self.mode = None
+        self.name = ''
+        self.presets = {}
+        self.preset_index = 0
+        self.path = path
+        self.original = path.read_bytes()
+        self.colors = load_colors(self.original.decode('utf-8'))
+        migrate_backups(path)
+        self.presets = load_presets(self.presets_path)
+        self.saved = copy.deepcopy(self.colors)
+        self.target = self.channel = 0
+        self.color_mode = 'RGB'
+        self.hsv_cache = {}
+        self.message = 'Selecciona un color. M: alternar RGB / tono, saturación y brillo.'
+        self.pending_exit = False
+        self.width = 32
+        self.hits = []
+
+    def controls(self):
+        if self.color_mode == 'RGB':
+            return ('Rojo', 'Verde', 'Azul'), self.colors[self.target].copy(), (255, 255, 255)
+        rgb = tuple(self.colors[self.target])
+        cached_rgb, values = self.hsv_cache.get(self.target, (None, None))
+        if cached_rgb != rgb:
+            h, s, v = colorsys.rgb_to_hsv(*(c/255 for c in rgb))
+            values = [h*360, s*100, v*100]
+            self.hsv_cache[self.target] = (rgb, values)
+        return ('Tono', 'Satur', 'Brillo'), values.copy(), (360, 100, 100)
+
+    def control_rgb(self, values):
+        if self.color_mode == 'RGB':
+            return values.copy()
+        return [round(c*255) for c in colorsys.hsv_to_rgb(values[0]/360, values[1]/100, values[2]/100)]
+
+    def set_channel(self, value):
+        _, values, limits = self.controls()
+        values[self.channel] = max(0, min(limits[self.channel], value))
+        self.colors[self.target] = self.control_rgb(values)
+        if self.color_mode == 'HSV':
+            # Conserva tono y saturación incluso al pasar por negro o gris.
+            self.hsv_cache[self.target] = (tuple(self.colors[self.target]), values)
+
+    def layout(self):
+        cols, rows = shutil.get_terminal_size()
+        left = min(48, max(35, cols * 44 // 100))
+        return cols, rows, left, left + 3, cols - left - 3
+
+    def draw(self):
+        cols, rows, left, right, panel = self.layout()
+        reset = ESC + '0m'
+        muted = ESC + '38;5;245m'
+        accent = ESC + '38;5;81m'
+        tracking = ESC+'?1003h' if self.mode == 'load' else ESC+'?1003l'+ESC+'?1002h'
+        out = [tracking + ESC + 'H' + reset + ESC + '2J']
+        self.hits = []
+
+        def put(x, y, text, width=None, fill=''):
+            width = cols - x if width is None else width
+            text = fit_text(text, width)
+            visible = text_width(text)
+            out.append(f'{ESC}{y};{x}H' + fill + text + fill + ' ' * (width-visible) + reset)
+
+        def box(x, y, width, height, title):
+            put(x, y, accent + '┌' + ('─ ' + title + ' ').ljust(width-2, '─') + '┐', width)
+            for row in range(y+1, y+height-1):
+                put(x, row, muted + '│', 1)
+                put(x+width-1, row, muted + '│', 1)
+            put(x, y+height-1, muted + '└' + '─'*(width-2) + '┘', width)
+
+        if cols < 80 or rows < 32:
+            put(2, 1, 'COLORSSH · Amplía la terminal a 80 × 32. Q: salir')
+            sys.stdout.write(''.join(out)); sys.stdout.flush()
+            return
+        put(2, 1, ESC + '1mCOLORSSH' + reset + '  /  Colores de Bash')
+        put(2, 2, muted + 'Selecciona un elemento · Ajusta el color · Comprueba el resultado · Guarda')
+        box(2, 3, left, 24, 'COMBINACIONES' if self.mode == 'load' else 'PALETA · 20 COLORES')
+        if self.mode == 'load':
+            names = list(self.presets)
+            start = self.preset_index // 20 * 20
+            for row, name in enumerate(names[start:start+20], 5):
+                selected = names.index(name) == self.preset_index
+                swatches = ''.join(sgr(c, True) + ' ' for c in self.presets[name][:8]) + reset
+                put(4, row, ('▶ ' if selected else '  ') + fit_text(name, left-15).ljust(left-15) + ' ' + swatches, left-4)
+                self.hits.append((4, row, left-4, ('preset', start+row-5)))
+            put(4, 25, f'{self.preset_index+1}/{len(names)}  ↑↓ elegir · Enter cargar', left-4)
+        else:
+            put(4, 4, muted + 'Elemento / muestra / HEX', left-4)
+            for i, name in enumerate(LABELS):
+                selected = i == self.target
+                label = fit_text(name, left-17).ljust(left-17)
+                text = (accent + '▶ ' if selected else '  ') + label + reset
+                text += ' ' + sgr(self.colors[i], True) + '  ' + reset + ' ' + hexcolor(self.colors[i])
+                put(4, 5+i, text, left-4)
+                self.hits.append((4, 5+i, left-4, ('target', i)))
+            put(4, 25, muted + '↑↓ / rueda: elegir · clic: seleccionar', left-4)
+
+        box(right, 3, panel, 8, 'EDITAR COLOR · ' + self.color_mode)
+        put(right+2, 4, ESC+'1m'+LABELS[self.target], panel-4)
+        self.width = panel-20
+        names, values, limits = self.controls()
+        for i, name in enumerate(names):
+            value = values[i]
+            pos = round(value*(self.width-1)/limits[i])
+            bar = ''
+            for x in range(self.width):
+                sample = values.copy()
+                sample[i] = round(x*limits[i]/(self.width-1))
+                if self.color_mode == 'HSV' and i == 0:
+                    sample[1:] = [100, 100]
+                color = self.control_rgb(sample)
+                ink = [0, 0, 0] if sum(color) > 382 else [255, 255, 255]
+                bar += sgr(color, True) + sgr(ink) + ('┃' if x == pos else ' ')
+            unit = ('°' if i == 0 else '%') if self.color_mode == 'HSV' else ''
+            put(right+2, 5+i, ('▶ ' if i == self.channel else '  ') + name.ljust(5) + ' ' + bar + reset + f' {round(value):3d}' + unit, panel-4)
+            self.hits.append((right+10, 5+i, self.width, ('channel', i)))
+        color = self.colors[self.target]
+        put(right+2, 8, f'{hexcolor(color)}  RGB({color[0]}, {color[1]}, {color[2]})', panel-4)
+        put(right+2, 9, muted + 'M: RGB / HSV · Tab: cambiar canal', panel-4)
+
+        box(right, 11, panel, 16, 'VISTA PREVIA · EN DIRECTO')
+        preview_name = list(self.presets)[self.preset_index] if self.mode == 'load' else None
+        preview_colors = self.presets[preview_name] if preview_name is not None else self.colors
+        base = sgr(preview_colors[0], True) + sgr(preview_colors[1])
+        prompt = sgr(preview_colors[3], True) + sgr(preview_colors[2]) + ESC+'1musuario@host:~$'+ESC+'22m'+base
+        for y in range(12, 26):
+            put(right+1, y, '', panel-2, base)
+        put(right+2, 12, prompt + ' ls -F --color=auto', panel-4, base)
+        cell = (panel-4)//2
+        for i, (_, _, _, sample) in enumerate(FILE_TYPES):
+            put(right+2+(i%2)*cell, 14+i//2, sgr(preview_colors[i+4]) + sample, cell, base)
+        put(right+2, 23, prompt + ' echo "Hola"', panel-4, base)
+        put(right+2, 24, 'Hola · Texto normal de la terminal', panel-4, base)
+        if preview_name is not None:
+            put(right+2, 25, 'Probar: ' + preview_name, panel-4, base)
+
+        put(2, 27, muted + 'Bash file: ' + display_text(self.path))
+        x = 2
+        actions = [('s', 'S Aplicar a Bash'), ('r', 'R Restaurar'), ('n', 'N Guardar combinación'), ('c', 'C Combinaciones'), ('q', 'Q Salir')]
+        if cols < 100:
+            actions = [('s', 'S Bash'), ('r', 'R Restaurar'), ('n', 'N Comb.'), ('c', 'C Cargar'), ('q', 'Q Salir')]
+        for key, label in actions:
+            text = '[ ' + label + ' ]'
+            put(x, 28, accent + text, len(text))
+            self.hits.append((x, 28, len(text), ('action', key)))
+            x += len(text)+1
+        put(2, 29, muted + 'M: RGB/HSV · ↑↓: elemento · ←→: ±1 · +/-: ±10 · Inicio/Fin: mín/máx')
+        changes = sum(a != b for a, b in zip(self.colors, self.saved))
+        put(2, 30, f'● {changes} colores modificados · S para aplicar a Bash' if changes else '✓ Sin cambios pendientes')
+        put(2, 31, self.message)
+        if self.mode == 'name':
+            put(2, 27, 'Guardar combinación · Nombre: ' + self.name + '_')
+            put(2, 28, 'Escribe un nombre y pulsa Enter · Esc: cancelar')
+        elif self.mode == 'load':
+            put(2, 28, 'Ratón / ↑↓: vista previa · Enter: cargar · Esc: cancelar')
+        sys.stdout.write(''.join(out)); sys.stdout.flush()
+
+    def act(self, key):
+        if self.mode:
+            if key in ('\x1b', '\x03'):
+                self.mode = None
+            elif self.mode == 'name':
+                if key in ('\r', '\n'):
+                    try:
+                        save_preset(self.presets_path, self.name, self.colors)
+                        self.message = 'Combinación guardada: ' + self.name.strip()
+                        self.mode = None
+                    except (OSError, ValueError) as error:
+                        self.message = display_text(error)
+                elif key in ('\x7f', '\b'):
+                    self.name = self.name[:-1]
+                elif len(key) == 1 and key.isprintable() and len(self.name) < 60:
+                    self.name += key
+            elif self.mode == 'load':
+                mouse = re.fullmatch(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', key)
+                if mouse and mouse[4] == 'M':
+                    button, x, y = map(int, mouse.group(1, 2, 3))
+                    if button in (64, 65):
+                        self.preset_index = (self.preset_index + (1 if button == 65 else -1)) % len(self.presets)
+                    elif button in (0, 32, 35):
+                        for hx, hy, width, (kind, index) in self.hits:
+                            if kind == 'preset' and y == hy and hx <= x < hx+width:
+                                self.preset_index = index
+                                break
+                if key in ('\x1b[A', '\x1b[B'):
+                    self.preset_index = (self.preset_index + (1 if key.endswith('B') else -1)) % len(self.presets)
+                elif key in ('\r', '\n'):
+                    name = list(self.presets)[self.preset_index]
+                    self.colors = copy.deepcopy(self.presets[name])
+                    self.hsv_cache.clear()
+                    self.message = 'Cargada: ' + name + '. S: aplicar a Bash.'
+                    self.mode = None
+            return True
+        if key in ('q', 'Q', '\x03', '\x1b'):
+            if self.colors != self.saved and not self.pending_exit:
+                self.message = 'Hay cambios sin guardar. Q otra vez: descartar; S: guardar.'
+                self.pending_exit = True
+                return True
+            return False
+        self.pending_exit = False
+        if key.lower() == 'm':
+            self.color_mode = 'HSV' if self.color_mode == 'RGB' else 'RGB'
+            self.message = ('HSV: tono = color · saturación = intensidad · brillo = luminosidad.'
+                            if self.color_mode == 'HSV' else 'RGB: rojo, verde y azul. M: volver a tono, saturación y brillo.')
+        elif key.lower() in ('n', 'g'):
+            self.mode = 'name'
+            self.name = ''
+        elif key.lower() == 'c':
+            try:
+                self.presets = load_presets(self.presets_path)
+                self.preset_index = 0
+                if self.presets:
+                    self.mode = 'load'
+                else:
+                    self.message = 'No hay combinaciones. N: guardar una con nombre.'
+            except (OSError, ValueError) as error:
+                self.message = display_text(error)
+        elif key.lower() == 's':
+            try:
+                self.original, backup = save_colors(self.path, self.original, self.colors)
+                self.saved = copy.deepcopy(self.colors)
+                self.message = 'Guardado. Copia: ' + backup.name
+            except (OSError, ValueError) as error:
+                self.message = display_text(error)
+        elif key.lower() == 'r':
+            self.colors = copy.deepcopy(self.saved)
+            self.hsv_cache.clear()
+            self.message = 'Restaurados los últimos colores guardados.'
+        elif key in ('\t', '\x1b[B', '\x1b[A'):
+            if key == '\t': self.channel = (self.channel+1) % 3
+            else: self.target = (self.target + (1 if key.endswith('B') else -1)) % len(LABELS)
+        elif key in ('\x1b[C', '\x1b[D', '+', '-', '\x1b[H', '\x1b[F', '\x1b[1~', '\x1b[4~'):
+            _, values, limits = self.controls()
+            current = round(values[self.channel])
+            if key in ('\x1b[H', '\x1b[1~'): value = 0
+            elif key in ('\x1b[F', '\x1b[4~'): value = limits[self.channel]
+            else: value = current + {'\x1b[C':1, '\x1b[D':-1, '+':10, '-':-10}[key]
+            self.set_channel(value)
+        else:
+            mouse = re.fullmatch(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', key)
+            if mouse:
+                button, x, y = map(int, mouse.group(1,2,3))
+                if mouse[4] == 'M' and button in (64, 65):
+                    self.target = (self.target + (1 if button == 65 else -1)) % len(LABELS)
+                if mouse[4] == 'M' and button in (0,32):
+                    for hx, hy, width, (kind, value) in self.hits:
+                        if y != hy or not hx <= x < hx+width:
+                            continue
+                        if kind == 'target' and button == 0:
+                            self.target = value
+                        elif kind == 'channel':
+                            self.channel = value
+                            self.set_channel(round((x-hx)*self.controls()[2][value]/(width-1)))
+                        elif kind == 'action' and button == 0:
+                            return self.act(value)
+                        break
+        return True
+
+    def run(self):
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        old_term = signal.getsignal(signal.SIGTERM)
+        def terminate(*_): raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, terminate)
+        buffer = ''
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        try:
+            tty.setraw(fd)
+            sys.stdout.write(ESC+'?1049h'+ESC+'?25l'+ESC+'?1002h'+ESC+'?1006h')
+            active = True
+            while active:
+                self.draw()
+                if not select.select([fd], [], [], .15)[0]: continue
+                chunk = os.read(fd, 4096)
+                if not chunk: break
+                buffer += decoder.decode(chunk)
+                while buffer:
+                    if buffer.startswith('\x1b'):
+                        match = re.match(r'\x1b\[(?:<\d+;\d+;\d+[Mm]|[0-9;]*[A-Za-z~])', buffer)
+                        if match: key = match[0]
+                        elif buffer == '\x1b':
+                            if select.select([fd], [], [], .04)[0]: break
+                            key = buffer
+                        elif len(buffer) < 64 and (buffer.startswith('\x1b[<') or not re.search('[A-Za-z~]', buffer[2:])): break
+                        else: key = buffer[:2]
+                    else: key = buffer[0]
+                    buffer = buffer[len(key):]
+                    active = self.act(key)
+                    if not active: break
+        finally:
+            sys.stdout.write(ESC+'0m'+ESC+'?1003l'+ESC+'?1002l'+ESC+'?1006l'+ESC+'?25h'+ESC+'?1049l')
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            signal.signal(signal.SIGTERM, old_term)
+        print('Para aplicar lo guardado en este shell: source ' + __import__('shlex').quote(str(self.path)))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Configura colores RGB de Bash con ratón o flechas y copia de seguridad automática.')
+    parser.add_argument('--bashrc', type=Path, default=Path.home()/'.bashrc', help='archivo Bash que editar (por defecto ~/.bashrc)')
+    parser.add_argument('--presets', type=Path, help='archivo JSON de combinaciones (por defecto ~/.config/colorssh/presets.json)')
+    args = parser.parse_args()
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        parser.exit(1, 'Ejecuta colorssh en una terminal interactiva.\n')
+    if os.geteuid() == 0:
+        parser.exit(1, 'No ejecutes colorssh como root.\n')
+    try:
+        App(args.bashrc.expanduser().resolve(), args.presets.expanduser().resolve() if args.presets else None).run()
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError) as error:
+        parser.exit(1, f'Error: {error}\n')
+
+
+if __name__ == '__main__':
+    main()
