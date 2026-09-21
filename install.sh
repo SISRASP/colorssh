@@ -8,7 +8,7 @@ fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 case "${1:-}" in
     -h|--help)
-        printf 'Uso: sh install.sh\nInstala Python 3, Bash y GNU coreutils si faltan, y ColorSSH en /usr/local/bin.\n'
+        printf 'Uso: sh install.sh\nInstala Python 3, Bash y GNU coreutils si faltan, y enlaza ColorSSH en /usr/local/bin.\n'
         exit 0 ;;
     '') ;;
     *) fail "Argumento desconocido: $1. Usa --help." ;;
@@ -69,10 +69,11 @@ command -v install >/dev/null 2>&1 || fail 'No se encuentra install en PATH.'
 python3 "$source_dir/colorssh" --help >/dev/null
 
 as_root install -d -m 755 /usr/local/bin
-as_root install -m 755 "$source_dir/colorssh" /usr/local/bin/colorssh
+chmod 755 "$source_dir/colorssh"
+as_root ln -sf "$source_dir/colorssh" /usr/local/bin/colorssh
 /usr/local/bin/colorssh --help >/dev/null
 
-printf '\nColorSSH instalado en /usr/local/bin/colorssh\n'
+printf '\nColorSSH enlazado en /usr/local/bin/colorssh\n'
 case ":$PATH:" in
     *:/usr/local/bin:*) printf 'Para abrirlo: colorssh\n' ;;
     *) printf 'Para abrirlo: /usr/local/bin/colorssh\n' ;;
